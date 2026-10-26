@@ -1802,12 +1802,19 @@ function v2Credential(methodID, r) {
 // v2Chat is the chat completion a LanguageModelV3 call becomes: system
 // messages as system, an assistant's tool calls as tool_calls with the
 // call's input as its arguments JSON, a tool message of the results that
-// follow the calls they answer. The tool result's own content parts go as
-// text or images; Devin's tool message takes only text, so a result's
-// images go with the next user message headed as magpie's built-in heads
-// them.
+// follow the calls they answer. A result's own content parts go as its
+// text; its images go with the next user message, as Devin's tool message
+// is text only.
 function v2Chat(options, modelID) {
   const messages = []
+  // images a tool result carried, headed into the user message that follows
+  // them (Devin's tool message is text only)
+  let pending = []
+  const flush = (content) => {
+    if (!pending.length) return
+    content.push(...pending)
+    pending = []
+  }
   for (const m of options.prompt ?? []) {
     if (m.role === "system") {
       messages.push({ role: "system", content: m.content })
@@ -1828,13 +1835,15 @@ function v2Chat(options, modelID) {
     if (m.role === "tool") {
       for (const p of m.content ?? []) {
         if (p.type !== "tool-result") continue
-        const text = v2ToolText(p.output)
+        const { text, files } = v2ToolParts(p.output)
         messages.push({ role: "tool", tool_call_id: p.toolCallId, content: text })
+        pending.push(...files)
       }
       continue
     }
     if (m.role !== "user") continue
     const content = []
+    flush(content)
     for (const p of m.content ?? []) {
       if (p.type === "text") content.push({ type: "text", text: p.text })
       else if (p.type === "file") {
@@ -1844,6 +1853,7 @@ function v2Chat(options, modelID) {
     }
     if (content.length) messages.push({ role: "user", content })
   }
+  if (pending.length) messages.push({ role: "user", content: pending })
   return {
     model: modelID,
     messages,
@@ -1871,19 +1881,28 @@ function v2Effort(options) {
   return ""
 }
 
-function v2ToolText(output) {
-  if (!output || typeof output !== "object") return String(output ?? "")
-  if (output.type === "text" || output.type === "error") return typeof output.value === "string" ? output.value : JSON.stringify(output.value ?? "")
-  if (output.type === "json") return JSON.stringify(output.value ?? null)
-  if (output.type === "content")
-    return (output.value ?? [])
-      .map((p) => {
-        if (p.type === "text") return p.text ?? ""
-        if (p.mediaType?.startsWith("image/")) return "[image]"
-        return `[${p.mediaType || "file"}]`
-      })
-      .join("\n")
-  return JSON.stringify(output)
+// v2ToolParts is a tool result's output as the text its tool message takes
+// and the image parts it can't — those go with the next user message, the
+// way a result's images reach Devin otherwise.
+function v2ToolParts(output) {
+  if (!output || typeof output !== "object") return { text: String(output ?? ""), files: [] }
+  if (output.type === "text" || output.type === "error")
+    return { text: typeof output.value === "string" ? output.value : JSON.stringify(output.value ?? ""), files: [] }
+  if (output.type === "json") return { text: JSON.stringify(output.value ?? null), files: [] }
+  if (output.type === "content") {
+    const texts = []
+    const files = []
+    for (const p of output.value ?? []) {
+      if (p.type === "text") texts.push(p.text ?? "")
+      else if (p.mediaType?.startsWith("image/")) {
+        const d = v2FileData(p)
+        if (d) files.push({ type: "image_url", image_url: { url: d } })
+        else texts.push("[image]")
+      } else texts.push(`[${p.mediaType || "file"}]`)
+    }
+    return { text: texts.join("\n"), files }
+  }
+  return { text: JSON.stringify(output), files: [] }
 }
 
 // v2FileData is a prompt file part as a data URL, "" for one without
@@ -1913,13 +1932,17 @@ function v2Usage(u = {}) {
 
 // devinLanguage is the LanguageModelV3 the sdk hook hands a devin model:
 // its calls go through GetChatMessage as a streamed chat completion.
-function devinLanguage(modelID, auth) {
+// getAuth resolves the account's key at call time so a sign-in, sign-out or
+// account switch since setup is picked up.
+function devinLanguage(modelID, getAuth) {
   return {
     specificationVersion: "v3",
     provider: "devin",
     modelId: modelID,
     supportedUrls: {},
     async doGenerate(options) {
+      const auth = await getAuth()
+      if (!auth?.key) throw new Error("Devin isn't signed in")
       const { key, server } = await live(auth)
       const families = await familiesFor(key, server)
       const chat = v2Chat(options, modelID)
@@ -1941,18 +1964,38 @@ function devinLanguage(modelID, auth) {
       }
     },
     async doStream(options) {
+      const auth = await getAuth()
+      if (!auth?.key) throw new Error("Devin isn't signed in")
       const { key, server } = await live(auth)
       const families = await familiesFor(key, server)
       const chat = v2Chat(options, modelID)
       const rt = await roundtrip({ key, server, families }, chat, options.abortSignal)
       if (!rt.it) throw new Error(rt.message || `Devin: ${rt.status}`)
       const stream = new ReadableStream({
+        // the calls the reply has opened, by the index Devin gives their
+        // args; _open is the one args deltas now belong to
         _calls: new Map(),
-        _open: null,
+        _open: -1,
+        _reasoning: false,
+        _text: false,
         async start(ctl) {
           ctl.enqueue({ type: "stream-start", warnings: [] })
+        },
+        // reasoning-start and text-start open on their first delta, so a turn
+        // without reasoning announces none.
+        _openReasoning(ctl) {
+          if (this._reasoning) return
+          this._reasoning = true
           ctl.enqueue({ type: "reasoning-start", id: "r1" })
+        },
+        _openText(ctl) {
+          if (this._text) return
+          this._text = true
           ctl.enqueue({ type: "text-start", id: "t1" })
+        },
+        _close(ctl) {
+          if (this._reasoning) ctl.enqueue({ type: "reasoning-end", id: "r1" })
+          if (this._text) ctl.enqueue({ type: "text-end", id: "t1" })
         },
         async pull(ctl) {
           for (;;) {
@@ -1962,28 +2005,34 @@ function devinLanguage(modelID, auth) {
               return
             }
             const e = r.value
-            if (e.text) return ctl.enqueue({ type: "text-delta", id: "t1", delta: e.text })
-            if (e.reasoning) return ctl.enqueue({ type: "reasoning-delta", id: "r1", delta: e.reasoning })
+            if (e.text) {
+              this._openText(ctl)
+              return ctl.enqueue({ type: "text-delta", id: "t1", delta: e.text })
+            }
+            if (e.reasoning) {
+              this._openReasoning(ctl)
+              return ctl.enqueue({ type: "reasoning-delta", id: "r1", delta: e.reasoning })
+            }
             if (e.tool) {
-              this._open = e.tool.id
-              this._calls.set(e.tool.id, { name: e.tool.name, input: "" })
+              this._open = e.tool.index
+              this._calls.set(e.tool.index, { id: e.tool.id, name: e.tool.name, input: "" })
               ctl.enqueue({ type: "tool-input-start", id: e.tool.id, toolName: e.tool.name })
               return
             }
             if (e.args) {
-              const c = this._calls.get(this._open)
-              if (c) c.input += e.args.text
-              ctl.enqueue({ type: "tool-input-delta", id: this._open, delta: e.args.text })
+              const c = this._calls.get(e.args.index ?? this._open)
+              if (!c) continue
+              c.input += e.args.text
+              ctl.enqueue({ type: "tool-input-delta", id: c.id, delta: e.args.text })
               return
             }
             if (e.stop) {
-              for (const [id, c] of this._calls) {
-                ctl.enqueue({ type: "tool-input-end", id })
-                ctl.enqueue({ type: "tool-call", toolCallId: id, toolName: c.name, input: c.input || "{}" })
+              for (const [, c] of this._calls) {
+                ctl.enqueue({ type: "tool-input-end", id: c.id })
+                ctl.enqueue({ type: "tool-call", toolCallId: c.id, toolName: c.name, input: c.input || "{}" })
               }
               this._calls.clear()
-              ctl.enqueue({ type: "reasoning-end", id: "r1" })
-              ctl.enqueue({ type: "text-end", id: "t1" })
+              this._close(ctl)
               ctl.enqueue({ type: "finish", finishReason: { unified: e.stop === "tool_calls" ? "tool-calls" : e.stop === "length" ? "length" : "stop", raw: e.stop }, usage: v2Usage(e.usage) })
               ctl.close()
               return
@@ -1996,13 +2045,12 @@ function devinLanguage(modelID, auth) {
           }
         },
         _finish(ctl) {
-          for (const [id, c] of this._calls) {
-            ctl.enqueue({ type: "tool-input-end", id })
-            ctl.enqueue({ type: "tool-call", toolCallId: id, toolName: c.name, input: c.input || "{}" })
+          for (const [, c] of this._calls) {
+            ctl.enqueue({ type: "tool-input-end", id: c.id })
+            ctl.enqueue({ type: "tool-call", toolCallId: c.id, toolName: c.name, input: c.input || "{}" })
           }
           this._calls.clear()
-          ctl.enqueue({ type: "reasoning-end", id: "r1" })
-          ctl.enqueue({ type: "text-end", id: "t1" })
+          this._close(ctl)
           ctl.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: v2Usage() })
           ctl.close()
         },
@@ -2030,6 +2078,13 @@ function v2Models(families, keep, images, free, prices) {
     enabled: true,
     limit: { context: m.context, output: m.output },
   }))
+}
+
+// connKey identifies a connection the way OpenCode does, so a refetched
+// record of the same sign-in isn't taken for a switch.
+function connKey(c) {
+  if (!c) return ""
+  return c.type === "credential" ? `credential:${c.id}` : `env:${c.name}`
 }
 
 // v2Setup is the plugin's v2 half: the integration and its sign-in
@@ -2075,13 +2130,21 @@ async function v2Setup(ctx) {
     })
   })
 
+  // authFor resolves the active connection's key each call, so a chat goes
+  // out on the account that is signed in when it is made, not the one setup
+  // saw: a sign-in, a sign-out or a switch of accounts is picked up without
+  // a reload.
   const authFor = async () => {
     const connection = await ctx.integration.connection.active(ID)
     if (!connection) return null
-    const value = await ctx.integration.connection.resolve(connection)
+    const value = await ctx.integration.connection.resolve(connection).catch(() => null)
     return v2Auth(value)
   }
 
+  // The provider's list: SNAPSHOT's until the account's own arrives, then
+  // that — so a model the account lists that the snapshot never heard of is
+  // a model "opencode models" shows. The provider transform re-runs on each
+  // reload, reading whatever source.models refresh() last set.
   await ctx.provider.transform((editor) => {
     editor.add({
       info: {
@@ -2094,58 +2157,87 @@ async function v2Setup(ctx) {
         package: "aisdk:@ai-sdk/openai-compatible@2.0.41",
         settings: { baseURL: BASE },
       },
-      models: v2Models(familiesOf(SNAPSHOT), [], SNAPSHOT_IMAGES),
+      models: source.models ?? v2Models(familiesOf(SNAPSHOT), [], SNAPSHOT_IMAGES),
       sourceConnection: source.connection,
     })
   })
 
-  // The account's own list replaces the snapshot's whenever the
-  // connection's account gave one.
-  await ctx.model.transform((editor) => {
-    const models = source.models
-    if (!models?.length) return
-    for (const m of editor.list(ID)) if (!models.some((x) => x.id === m.id)) editor.remove(ID, m.id)
-    for (const m of models) editor.update(ID, m.id, (draft) => Object.assign(draft, m))
-  })
-
-  const refresh = async () => {
-    const connection = await ctx.integration.connection.active(ID)
-    source.connection = connection
-    if (!connection) {
-      source.auth = null
-      source.models = null
-      await ctx.provider.reload()
-      return
-    }
-    const value = await ctx.integration.connection.resolve(connection)
-    source.auth = v2Auth(value)
-    if (!source.auth?.key) {
-      source.models = null
-      await ctx.provider.reload()
-      return
-    }
-    const { key, server } = await live(source.auth)
-    const images = await imagesFor(key, server)
-    const { free, prices } = await configsFor(key, server)
-    const families = await ownFamilies(key, server)
-    source.models = v2Models(families ?? familiesOf(SNAPSHOT), [], images, free, prices)
-    await ctx.provider.reload()
-    await ctx.model.reload()
+  // refresh re-reads the account: a sign-in arms the sdk hook, a sign-out
+  // disarms it, and the account's own model list replaces the snapshot's.
+  // Its network asks (images, configs, families) run off the setup path.
+  let refreshing = null
+  let stale = false
+  const refresh = () => {
+    refreshing ??= (async () => {
+      try {
+        const connection = await ctx.integration.connection.active(ID)
+        source.connection = connection
+        if (!connection) {
+          source.auth = null
+          source.models = null
+          await ctx.provider.reload()
+          return
+        }
+        const value = await ctx.integration.connection.resolve(connection).catch(() => null)
+        source.auth = v2Auth(value)
+        if (!source.auth?.key) {
+          source.models = null
+          await ctx.provider.reload()
+          return
+        }
+        const { key, server } = await live(source.auth)
+        const [images, { free, prices }, families] = await Promise.all([
+          imagesFor(key, server).catch(() => null),
+          configsFor(key, server).catch(() => ({})),
+          ownFamilies(key, server).catch(() => null),
+        ])
+        source.models = v2Models(families ?? familiesOf(SNAPSHOT), [], images ?? SNAPSHOT_IMAGES, free, prices)
+        // the account may have signed out or switched while the asks ran:
+        // its list then belongs to the connection the reads answered, so
+        // drop it and take the new account's turn next.
+        if (connKey(await ctx.integration.connection.active(ID)) !== connKey(connection)) {
+          source.models = null
+          stale = true
+          return
+        }
+        await ctx.provider.reload()
+        await ctx.model.reload()
+      } finally {
+        refreshing = null
+        if (stale) {
+          stale = false
+          void refresh()
+        }
+      }
+    })()
+    return refreshing
   }
 
   // The models a chat is sent to Devin as, and the key it goes with. The
   // SDK the package's own factory made is replaced wholesale: every call
-  // goes through GetChatMessage.
+  // goes through GetChatMessage, resolving the active account at call time.
   await ctx.aisdk.hook(
     "sdk",
     (evt) => {
       if (!source.auth?.key) return
-      evt.sdk = { languageModel: (id) => devinLanguage(id, source.auth) }
+      evt.sdk = { languageModel: (id) => devinLanguage(id, authFor) }
     },
     { providerID: ID },
   )
 
-  await refresh()
+  // A sign-in, sign-out or account switch re-reads the account and reloads
+  // the provider list it publishes.
+  if (ctx.event?.subscribe)
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe())
+          if (event?.type === "credential.switched" && event?.data?.integrationID === ID) await refresh()
+      } catch {}
+    })()
+
+  // Setup registers the hooks and returns; the account's first read happens
+  // in the background so Devin being unreachable doesn't stall the host.
+  void refresh()
 }
 
 export default {
@@ -2355,4 +2447,4 @@ export async function DevinAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames, v2Chat, v2ToolParts, v2FileData, v2Effort, v2ResponseFormat, v2Usage, v2Auth, v2Credential, v2Models, devinLanguage, v2Setup, connKey }

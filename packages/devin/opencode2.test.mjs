@@ -171,6 +171,7 @@ test("v2Usage takes cached tokens out of the uncached count", () => {
   expect(v2Usage({ prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 900, cache_write_tokens: 0 } }).inputTokens)
     .toEqual({ total: 1000, noCache: 100, cacheRead: 900, cacheWrite: 0 })
   expect(v2Usage({ prompt_tokens: 10, completion_tokens: 5 }).inputTokens.noCache).toBe(10)
+  expect(v2Usage().inputTokens).toEqual({ total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined })
 })
 
 test("v2Chat turns toolChoice none into tool_choice none and reads effort from providerOptions", () => {

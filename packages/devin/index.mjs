@@ -1926,7 +1926,7 @@ function v2ResponseFormat(f) {
 function v2Usage(u = {}) {
   const cacheRead = u.prompt_tokens_details?.cached_tokens, cacheWrite = u.prompt_tokens_details?.cache_write_tokens
   return {
-    inputTokens: { total: u.prompt_tokens, noCache: u.prompt_tokens - (cacheRead || 0) - (cacheWrite || 0), cacheRead, cacheWrite },
+    inputTokens: { total: u.prompt_tokens, noCache: u.prompt_tokens == null ? undefined : u.prompt_tokens - (cacheRead || 0) - (cacheWrite || 0), cacheRead, cacheWrite },
     outputTokens: { total: u.completion_tokens, text: undefined, reasoning: undefined },
   }
 }

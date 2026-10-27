@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test"
 import plugin, { _internal } from "./index.mjs"
 
-const { PB, frame, v2Chat, v2ToolParts, v2FileData, v2Effort, v2Auth, devinLanguage, v2Setup, connKey } = _internal
+const { PB, frame, v2Chat, v2ToolParts, v2FileData, v2Effort, v2Auth, devinLanguage, v2Setup, connKey, v2Usage } = _internal
 const real = globalThis.fetch
 afterEach(() => (globalThis.fetch = real))
 const enc = new TextEncoder()
@@ -165,6 +165,12 @@ test("v2FileData takes bytes, base64, URLs and data URLs", () => {
   expect(v2FileData({ mediaType: "image/png", data: "https://x.test/i.png" })).toBe("https://x.test/i.png")
   expect(v2FileData({ mediaType: "image/png", data: "data:image/png;base64,aGk=" })).toBe("data:image/png;base64,aGk=")
   expect(v2FileData({ mediaType: "image/png", data: new URL("https://x.test/i.png") })).toBe("https://x.test/i.png")
+})
+
+test("v2Usage takes cached tokens out of the uncached count", () => {
+  expect(v2Usage({ prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 900, cache_write_tokens: 0 } }).inputTokens)
+    .toEqual({ total: 1000, noCache: 100, cacheRead: 900, cacheWrite: 0 })
+  expect(v2Usage({ prompt_tokens: 10, completion_tokens: 5 }).inputTokens.noCache).toBe(10)
 })
 
 test("v2Chat turns toolChoice none into tool_choice none and reads effort from providerOptions", () => {
